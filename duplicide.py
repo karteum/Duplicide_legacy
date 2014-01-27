@@ -36,23 +36,23 @@ import fnmatch # re ?
 #import platform
 from multiprocessing import Process, Array
 
-#~ MAXMAPSIZE = 1<<(int(platform.architecture()[0][0:2])-1) - 1<<20  # FIXME: it also assumes number of bits takes 2 digits, so it does not work for 128bit platforms ! :). The 1<<20 is to take a small margin.
 # TODO: allow disjoint chunks ? allow rdiff-like sliding-window CRC ?
 def checksum_file(filename, size=-1, hashalgo='crc32', CHUNK=(1<<25)): # FIXME: too big chunk ?
+    # This function used to rely on mmap(), however this is an issue for big files on 32 bits machines
+    #~ MAXMAPSIZE = 1<<(int(platform.architecture()[0][0:2])-1) - 1<<20  # FIXME: it also assumes number of bits takes 2 digits, so it does not work for 128bit platforms ! :). The 1<<20 is to take a small margin.
     """Performs a hash (CRC32, or any other supported by hashlib such as MD5 or SHA256) on the first [size] bytes of the file [filename]"""
     if size>0:
         CHUNK = min(CHUNK, size)
     with open(filename,'r') as fh:
         readoffset = 0
-        mysize = os.stat(filename).st_size - 1 # why -1 ?
-        size = (size < 0) and min(mysize, size) or mysize
-        #~ realsize = min(abs(size), os.stat(filename).st_size-1, MAXMAPSIZE) # FIXME: -1 means "max" so min() does not work...
+        maxsize = os.stat(filename).st_size - 1 # FIXME: why -1 ?
+        readsize = (size < 0) and maxsize or min(maxsize, size)
         #~ map = mmap.mmap(fh.fileno(), realsize, mmap.MAP_PRIVATE, mmap.PROT_READ)
         if (hashalgo == "crc32" or hashalgo == "adler32"):
             #~ result = hex(zlib.crc32(map[0:realsize]) & 0xffffffff) # or binascii.crc32
             crcfun = (hashalgo == "adler32") and zlib.adler32 or zlib.crc32 # or binascii.crc32
             mycrc = 0
-            while (readoffset < size): # len(buf) > 0
+            while (readoffset < readsize):
                 #map = mmap.mmap(fh.fileno(), CHUNK, access=mmap.ACCESS_READ, offset=readoffset)
                 buf = fh.read(CHUNK)
                 mycrc = crcfun(buf, mycrc)
@@ -63,7 +63,7 @@ def checksum_file(filename, size=-1, hashalgo='crc32', CHUNK=(1<<25)): # FIXME: 
             digest = hashlib.new(hashalgo) # or md5.new()
             buf = fh.read(CHUNK)
             while (len(buf) > 0 and readoffset < size): # FIXME: Do we need both ?
-                digest.update(fh.read(realsize))
+                digest.update(buf)
                 #~ digest.update(map[0:realsize])
                 readoffset += len(buf)
                 buf = fh.read(CHUNK)
@@ -89,7 +89,7 @@ class progresswalk:
         self.numdirs = [0+0j]
 
     def update(self, dir, dirs):
-        # numdirs[] is processed as a "polynom". It is using complex numbers in order to avoid using 2 list: real part is total number of dirs, and imag part is number of processed dirs
+        # numdirs[] is processed as a "polynom". It is using complex numbers in order to avoid using 2 lists: real part is total number of dirs, and imag part is number of processed dirs
         current_depth = dir.count('/') - self.init_depth
         if len(self.numdirs) < current_depth+2:
             self.numdirs.append(0+0j)
@@ -117,7 +117,6 @@ class dupcontext:
         self.roots = []
 
         self.dupresultsD = defaultdict(list) ; self.dupresultsF = defaultdict(list) # the result
-        self.queue = Queue.Queue()
 
         #incdirs = defaultdict(list) ; incfiles = defaultdict(list)
         #dupresults = defaultdict(list) # the result
@@ -159,9 +158,7 @@ class dupcontext:
             self.dirsAttrsOnFiles[dir] = [len(files)]
             self.dirsAttrsOnSubdirs[dir] = [len(dirs)]
             for file in files:
-                path=dir+'/'+file
-                size = self.__add_file(path)
-                dirsize += size
+                dirsize += self.__add_file(dir+'/'+file)
 
             # Increment all parents dir size with current dir size
             while(dirsize > 0 and dir != init_path and dir != '/'):
@@ -302,7 +299,7 @@ if __name__ == "__main__":
         init_path = arg.rstrip('/')
         context.scandir(init_path)
     context.process()
-    print "\nDuplicate dirs for %s:" % (init_path,)
+    print "\nDuplicate dirs:"
     context.print_dupdirs()
     print "\nDuplicate files:"
     context.print_dupfiles()
