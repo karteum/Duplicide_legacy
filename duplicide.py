@@ -5,13 +5,12 @@
 # Author: Adrien Demarez (adrien.demarez@free.fr)
 # Version: 20140119
 # License: GPLv3
-#
-# Inspiration: https://code.google.com/p/fslint/source/browse/trunk/fslint/findup
+# Usage: python duplicide.py dir1/ [dir2] [...]
 #
 # Goals:
 #   - detect duplicate files (like fslint and any other similar tools), as quickly as possible i.e. without performing hash/compare unnecessarily and without unnecessary I/O, and with a proper progressbar
 #   - detect duplicate dirs (i.e. don't output files/dirs as a result if the whole parent dir is itself a duplicate).
-#   - don't output pseudo-duplicate that are hard links. Process by sorted inode in order to limit HDD seeks (like fslint)
+#   - don't output pseudo-duplicate that are hard links. Process by sorted inode in order to limit HDD seeks (like fslint in https://code.google.com/p/fslint/source/browse/trunk/fslint/findup )
 #   - can process hash on a small fraction of the files instead of the whole file in order to speedup tests (at the expense of reliability / risk of false positive => human double-check is necessary !). In practical situations (99% of the time), identical size + identical crc32 on fist kbytes is OK...
 #   - it's only a detection program. What to do with duplicates (e.g. delete them or making hard links or symlinks or any other idea) is up to the user or calling script/program.
 #
@@ -37,39 +36,32 @@ import fnmatch # re ?
 from multiprocessing import Process, Array
 
 # TODO: allow disjoint chunks ? allow rdiff-like sliding-window CRC ?
-def checksum_file(filename, size=-1, hashalgo='crc32', CHUNK=(1<<25)): # FIXME: too big chunk ?
+def checksum_file(filename, size=-1, hashalgo='crc32', chunk=-1): # (1<<12)
     # This function used to rely on mmap(), however this is an issue for big files on 32 bits machines
     #~ MAXMAPSIZE = 1<<(int(platform.architecture()[0][0:2])-1) - 1<<20  # FIXME: it also assumes number of bits takes 2 digits, so it does not work for 128bit platforms ! :). The 1<<20 is to take a small margin.
     """Performs a hash (CRC32, or any other supported by hashlib such as MD5 or SHA256) on the first [size] bytes of the file [filename]"""
-    if size>0:
-        CHUNK = min(CHUNK, size)
+    maxsize = int(os.stat(filename).st_size) - 1 # FIXME: why -1 ?
+    readsize = (size > 0) and min(maxsize, size) or maxsize
+    readchunk = (chunk > 0) and min(chunk, readsize) or readsize
     with open(filename,'r') as fh:
         readoffset = 0
-        maxsize = os.stat(filename).st_size - 1 # FIXME: why -1 ?
-        readsize = (size < 0) and maxsize or min(maxsize, size)
-        #~ map = mmap.mmap(fh.fileno(), realsize, mmap.MAP_PRIVATE, mmap.PROT_READ)
+        #~ map = mmap.mmap(fh.fileno(), realsize, mmap.MAP_PRIVATE, mmap.PROT_READ) #~ map = mmap.mmap(fh.fileno(), CHUNK, access=mmap.ACCESS_READ, offset=readoffset)
         if (hashalgo == "crc32" or hashalgo == "adler32"):
-            #~ result = hex(zlib.crc32(map[0:realsize]) & 0xffffffff) # or binascii.crc32
             crcfun = (hashalgo == "adler32") and zlib.adler32 or zlib.crc32 # or binascii.crc32
             mycrc = 0
             while (readoffset < readsize):
-                #map = mmap.mmap(fh.fileno(), CHUNK, access=mmap.ACCESS_READ, offset=readoffset)
-                buf = fh.read(CHUNK)
+                buf = fh.read(readchunk)
                 mycrc = crcfun(buf, mycrc)
                 readoffset += len(buf)
-                #map.close()
-            return hex(mycrc & 0xffffffff)
+            return hex(mycrc & 0xffffffff) #~ hex(zlib.crc32(map[0:realsize]) & 0xffffffff)
         else:
             digest = hashlib.new(hashalgo) # or md5.new()
-            buf = fh.read(CHUNK)
-            while (len(buf) > 0 and readoffset < size): # FIXME: Do we need both ?
-                digest.update(buf)
-                #~ digest.update(map[0:realsize])
+            while (readoffset < readsize): # while len(buf) > 0 ?
+                buf = fh.read(readchunk)
+                digest.update(buf) #~ (map[0:realsize])
                 readoffset += len(buf)
-                buf = fh.read(CHUNK)
             return digest.hexdigest()
         #~ map.close()
-        #~ fh.close()
 
 def checksum_props(props, hashalgo='crc32'):
     """Returns a hash from the 'properties' of a directory (size and MD5 of child files and subdirs, etc.). If two dirs have the same 'md5props', they will be considered as duplicates"""
@@ -110,27 +102,26 @@ class dupcontext:
         self.inodesfiles = defaultdict(list) ; self.filesinodes = defaultdict(int)
         self.hashinodes = defaultdict(list) ;  self.inodeshash = {}
 
-        # For dirs : for each dir key, dirproperties[key] is a list of entries. values[0] is the number of files, values[1] is the size of the dir, then values[2:..] contains the file sizes, then we also push later computed hashes for files
-        self.dirsAttrsOnFiles = {} ;        self.dirsAttrsOnSubdirs = {} # Same as dirsAttrsOnFiles, except it is for subdirs entries instead of file entries
+        # For dirs : for each dir key, dirsAttrsOnFiles[key] (resp. dirsAttrsOnSubdirs for subdirs instead of subfiles) is a list of entries. values[0] is the number of files, values[1] is the size of the dir, then values[2:..] contains the file sizes, then we also push later computed hashes for files
+        self.dirsAttrsOnFiles = {} ;        self.dirsAttrsOnSubdirs = {}
         self.sizedirs = defaultdict(list) ; self.dirsizes = defaultdict(int)
         self.hashdirs = defaultdict(list) ; self.dirshash = {}
         self.roots = []
 
         self.dupresultsD = defaultdict(list) ; self.dupresultsF = defaultdict(list) # the result
-
         #incdirs = defaultdict(list) ; incfiles = defaultdict(list)
-        #dupresults = defaultdict(list) # the result
 
     def __add_file(self, path):
         if not os.path.exists(path):
+            # Skip broken symlinks, and cases where we do not have access rights. TODO: check whether access rights are tied to inode or path
             sys.stderr.write("Unable to access %s!\n" % (path,))
-            return 0 # Skip broken symlinks, and cases where we do not have access rights. TODO: check whether access rights are tied to inode or path
+            return 0
         filestat = os.lstat(path)
         size = int(filestat.st_size)
         if (not option_include_nullfiles and size == 0) or (not option_include_nonregfiles and not stat.S_ISREG(filestat.st_mode)): # not os.path.isfile(path):
             # FIXME: include those files in another db, so that comparing dirs will not omit them ? or just serialize the whole stat().st_mode in dirsAttrsOnSubdirs ?
             return 0
-        #dirsAttrsOnFiles[dir].append(size)
+        #~ dirsAttrsOnFiles[dir].append(size)
         fakeino = (filestat.st_dev << 32) | filestat.st_ino  # "fake" inode (merging dev and inode in order to get a unique ID. FIXME: maybe st_dev can change across reboots or device insertion/removal ? In that case, it would be dangerous to serialize/deserialize and mix loaded info with new scanned info ?
         if option_include_hardlinks or not fakeino in self.inodesfiles:
             self.sizeinodes[size].append(fakeino) # FIXME: use set instead of list to ensure unicity !
@@ -145,7 +136,6 @@ class dupcontext:
     def scandir(self, init_path):
         """Add a dir to the scan context"""
         self.roots.append(init_path)
-        #i=0 ; total=1
         progress = progresswalk(init_path)
         for (dir, dirs, files) in os.walk(init_path):
             progress.update(dir, dirs)
@@ -199,10 +189,10 @@ class dupcontext:
             file0 = self.inodesfiles[inode][0] # N.B. the access rights and other properties are identical to all hard links as they are bound to the inode
             curr_hash = "%s_%s" % (curr_size, checksum_file(file0, size=SIZE_CKSUM, hashalgo='adler32'))
             for file in self.inodesfiles[inode]:
-                self.dirsAttrsOnFiles[os.path.dirname(file)].append(curr_hash) # FIXME: OK in case of hard links ?
-            if option_include_hardlinks or not inode in self.inodeshash.keys():
-                self.hashinodes[curr_hash].append(inode)
-                self.inodeshash[inode] = curr_hash
+                self.dirsAttrsOnFiles[os.path.dirname(file)].append(curr_hash)
+            #~ if not inode in self.inodeshash.keys():
+            self.hashinodes[curr_hash].append(inode)
+            self.inodeshash[inode] = curr_hash
 
             completion = (100*i)/total
             sys.stderr.write("\rComputing checksums for dev/inode 0x%x: [%d %%]" % (inode, completion))
@@ -242,7 +232,6 @@ class dupcontext:
                     #~ print "Skipping %s %d %d %d %s" % (dir, len(dirsAttrsOnSubdirs[dir]), len(dirs), len(sizedirs[dirsizes[dir]]), str(dirsAttrsOnSubdirs[dir]))
 
     def __compute_duplicates(self):
-        print "\nProcessing entries..."
         #~ dupdirset = set()
         for dupdirs in filter(lambda x: len(x)>1, self.hashdirs.values()):
             for currentdir in dupdirs:
@@ -262,6 +251,7 @@ class dupcontext:
         # TODO: double-check with filecmp.cmp()
 
     def __print_duplicates(self, dupresults, files=False):
+        # TODO: allow mixed files/dirs output
         resultsorted = {}
         for k,v in dupresults.iteritems():
             resultsorted[int(k.partition('_')[0])] = v
@@ -287,7 +277,7 @@ SIZE_CKSUM = (1<<16)
 option_include_nullfiles = False
 option_include_nonregfiles = False # FIXME: 'True' case is not handled yet !
 option_include_hardlinks = False
-option_excludelist = ["/home/adrien/.google2"]
+option_excludelist = []
 
 if __name__ == "__main__":
     #parser = argparse.ArgumentParser(description='Detects all the duplicate files and dirs')
@@ -295,6 +285,9 @@ if __name__ == "__main__":
     #args=parser.parse_args()
     #print args
     context = dupcontext()
+    if len(sys.argv)==1:
+        print "Usage: duplicide dir1/ [dir2/ dir3/ ...]"
+        sys.exit (0)
     for arg in sys.argv:
         init_path = arg.rstrip('/')
         context.scandir(init_path)
