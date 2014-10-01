@@ -1,4 +1,4 @@
 Duplicide
 =========
 
-A tool to detect duplicate files and dirs
+A tool to detect duplicate files and dirs.
