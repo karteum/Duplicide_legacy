@@ -34,18 +34,21 @@ import fnmatch # re ?
 #import argparse
 #import platform
 from multiprocessing import Process, Array
+import random
 
 # TODO: allow disjoint chunks ? allow rdiff-like sliding-window CRC ?
 def checksum_file(filename, size=-1, hashalgo='crc32', chunk=-1): # (1<<12)
     # This function used to rely on mmap(), however this is an issue for big files on 32 bits machines
     #~ MAXMAPSIZE = 1<<(int(platform.architecture()[0][0:2])-1) - 1<<20  # FIXME: it also assumes number of bits takes 2 digits, so it does not work for 128bit platforms ! :). The 1<<20 is to take a small margin.
     """Performs a hash (CRC32, or any other supported by hashlib such as MD5 or SHA256) on the first [size] bytes of the file [filename]"""
+    #return random.randint(0,1<<32-1)
     maxsize = int(os.stat(filename).st_size) - 1 # FIXME: why -1 ?
     readsize = (size > 0) and min(maxsize, size) or maxsize
     readchunk = (chunk > 0) and min(chunk, readsize) or readsize
     with open(filename,'r') as fh:
         readoffset = 0
-        #~ map = mmap.mmap(fh.fileno(), realsize, mmap.MAP_PRIVATE, mmap.PROT_READ) #~ map = mmap.mmap(fh.fileno(), CHUNK, access=mmap.ACCESS_READ, offset=readoffset)
+        #~ map = mmap.mmap(fh.fileno(), realsize, mmap.MAP_PRIVATE, mmap.PROT_READ)
+        #~ map = mmap.mmap(fh.fileno(), CHUNK, access=mmap.ACCESS_READ, offset=readoffset)
         if (hashalgo == "crc32" or hashalgo == "adler32"):
             crcfun = (hashalgo == "adler32") and zlib.adler32 or zlib.crc32 # or binascii.crc32
             mycrc = 0
@@ -92,6 +95,7 @@ class progresswalk:
             walkedRatio = walkedRatio*10 + int((9*self.numdirs[i].imag)/self.numdirs[i].real)
         completion = (100*walkedRatio) / (10**(len(self.numdirs)-3))
         self.numdirs[current_depth] += 1j
+        #sys.stderr.write("\rScanning: [%d %%]   %s" % (completion,str(self.numdirs))) # self.init_path
         sys.stderr.write("\rScanning: [%d %%]" % (completion,)) # self.init_path
 
 class dupcontext:
@@ -111,8 +115,9 @@ class dupcontext:
         self.dupresultsD = defaultdict(list) ; self.dupresultsF = defaultdict(list) # the result
         #incdirs = defaultdict(list) ; incfiles = defaultdict(list)
 
-    def __add_file(self, path):
-        if not os.path.exists(path):
+    def __add_file(self, dir, file):
+        path = dir + "/" + file
+        if not os.path.exists(path) or not os.access(path, os.R_OK):
             # Skip broken symlinks, and cases where we do not have access rights. TODO: check whether access rights are tied to inode or path
             sys.stderr.write("Unable to access %s!\n" % (path,))
             return 0
@@ -121,7 +126,7 @@ class dupcontext:
         if (not option_include_nullfiles and size == 0) or (not option_include_nonregfiles and not stat.S_ISREG(filestat.st_mode)): # not os.path.isfile(path):
             # FIXME: include those files in another db, so that comparing dirs will not omit them ? or just serialize the whole stat().st_mode in dirsAttrsOnSubdirs ?
             return 0
-        #~ dirsAttrsOnFiles[dir].append(size)
+        self.dirsAttrsOnFiles[dir].append(size) # BUGFIX: case where same number of subfiles, different file sizes but same sum(sizes), different filemd5
         fakeino = (filestat.st_dev << 32) | filestat.st_ino  # "fake" inode (merging dev and inode in order to get a unique ID. FIXME: maybe st_dev can change across reboots or device insertion/removal ? In that case, it would be dangerous to serialize/deserialize and mix loaded info with new scanned info ?
         if option_include_hardlinks or not fakeino in self.inodesfiles:
             self.sizeinodes[size].append(fakeino) # FIXME: use set instead of list to ensure unicity !
@@ -148,7 +153,7 @@ class dupcontext:
             self.dirsAttrsOnFiles[dir] = [len(files)]
             self.dirsAttrsOnSubdirs[dir] = [len(dirs)]
             for file in files:
-                dirsize += self.__add_file(dir+'/'+file)
+                dirsize += self.__add_file(dir, file)
 
             # Increment all parents dir size with current dir size
             while(dirsize > 0 and dir != init_path and dir != '/'):
@@ -187,17 +192,16 @@ class dupcontext:
         for inode in sorted(inodes_tohash):
             curr_size = self.inodessizes[inode]
             file0 = self.inodesfiles[inode][0] # N.B. the access rights and other properties are identical to all hard links as they are bound to the inode
-            curr_hash = "%s_%s" % (curr_size, checksum_file(file0, size=SIZE_CKSUM, hashalgo='adler32'))
+            curr_hash = "%s_%s" % (curr_size, checksum_file(file0, size=SIZE_CKSUM, hashalgo='md5')) # adler32
             for file in self.inodesfiles[inode]:
                 self.dirsAttrsOnFiles[os.path.dirname(file)].append(curr_hash)
             #~ if not inode in self.inodeshash.keys():
             self.hashinodes[curr_hash].append(inode)
             self.inodeshash[inode] = curr_hash
-
             completion = (100*i)/total
             sys.stderr.write("\rComputing checksums for dev/inode 0x%x: [%d %%]" % (inode, completion))
-            i+=1        
-    
+            i+=1
+
     def __isdup(self, path):
         return self.inodeshash[self.filesinodes[path]] > 1
 
@@ -224,7 +228,7 @@ class dupcontext:
                 if(len(self.sizedirs[self.dirsizes[dir]])>1 and len(self.dirsAttrsOnSubdirs[dir])==(1+len(dirs)) and len(self.dirsAttrsOnFiles[dir])==(1+len(files))):
                     tmp_props = sorted(self.dirsAttrsOnFiles[dir])
                     tmp_props.extend(sorted(self.dirsAttrsOnSubdirs[dir]))
-                    curr_hash = "%s_%s" % (self.dirsizes[dir], checksum_props(tmp_props, hashalgo='crc32'))
+                    curr_hash = "%s_%s" % (self.dirsizes[dir], checksum_props(tmp_props, hashalgo='md5')) # crc32
                     self.dirshash[dir] = curr_hash
                     self.hashdirs[curr_hash].append(dir)
                     self.dirsAttrsOnSubdirs[os.path.dirname(dir)].append(curr_hash)
@@ -248,6 +252,7 @@ class dupcontext:
                     currentdir = os.path.dirname(dupfile)
                     if not currentdir in self.dirshash or len(self.hashdirs[self.dirshash[currentdir]]) < 2:
                         self.dupresultsF[self.inodeshash[dupinode]].append(dupinode)
+                        # TODO: compute hashset() for the dir, to compare with peers and be able to eventually say dirA > dirB...
         # TODO: double-check with filecmp.cmp()
 
     def __print_duplicates(self, dupresults, files=False):
