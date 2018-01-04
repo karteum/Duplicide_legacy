@@ -35,6 +35,7 @@ import fnmatch # re ?
 #import platform
 from multiprocessing import Process, Array
 import random
+import cPickle
 
 # TODO: allow disjoint chunks ? allow rdiff-like sliding-window CRC ?
 def checksum_file(filename, size=-1, hashalgo='crc32', chunk=-1): # (1<<12)
@@ -160,6 +161,8 @@ class dupcontext:
                 self.dirsizes[dir] += dirsize
                 dir = os.path.dirname(dir)
 
+            #self.dirsizes[init_path] += (dirsize) > 0 and dirsize or 0 # FIXME : if two toplevels are identical ?
+
         # Reverse sizes for dirs
         for (dir,size) in self.dirsizes.iteritems():
             self.sizedirs[size].append(dir)
@@ -185,7 +188,8 @@ class dupcontext:
         # TODO: put this in a function and use multithreading for the computation ? (N.B. is it I/O or CPU bounded, especially in case of crc32 on the first 64k ?)
         # needs: sizeinodes, inodessizes, inodesfiles, inodeshash, hashinodes, dirsAttrsOnFiles
         inodes_tohash = []
-        for inodelist in filter(lambda x: len(x)>1, self.sizeinodes.values()):
+        #for inodelist in filter(lambda x: len(x)>1, self.sizeinodes.values()):
+        for inodelist in filter(lambda x: len(x)>=1, self.sizeinodes.values()):
             inodes_tohash.extend(inodelist)
 
         i = 0 ; total = len(inodes_tohash)
@@ -212,6 +216,7 @@ class dupcontext:
 
     def __bestParent(self, currentdir):
         parentdir = os.path.dirname(currentdir)
+        currentdir = parentdir
         while (parentdir in self.dirshash and len(self.hashdirs[self.dirshash[parentdir]])>1):
             #incdirs[parentdir].append(currentdir)
             currentdir = parentdir
@@ -224,23 +229,25 @@ class dupcontext:
         # needs: init_path, sizedirs, dirsizes, dirsAttrsOnSubdirs, dirsAttrsOnFiles, dirshash, hashdirs
         for init_path in self.roots:
             for (dir, dirs, files) in os.walk(init_path, topdown=False):
+                files2 = [tmp for tmp in files if (dir+'/'+tmp) in self.filesinodes]
                 # If any subdir or subfile wasn't added to the properties, it means it is not a duplicate, and therefore the current dir is not a duplicate
-                if(len(self.sizedirs[self.dirsizes[dir]])>1 and len(self.dirsAttrsOnSubdirs[dir])==(1+len(dirs)) and len(self.dirsAttrsOnFiles[dir])==(1+len(files))):
+                if(len(self.sizedirs[self.dirsizes[dir]])>1 and len(self.dirsAttrsOnSubdirs[dir])==(1+len(dirs)) and len(self.dirsAttrsOnFiles[dir])==(1+2*len(files2))):
                     tmp_props = sorted(self.dirsAttrsOnFiles[dir])
                     tmp_props.extend(sorted(self.dirsAttrsOnSubdirs[dir]))
                     curr_hash = "%s_%s" % (self.dirsizes[dir], checksum_props(tmp_props, hashalgo='md5')) # crc32
                     self.dirshash[dir] = curr_hash
                     self.hashdirs[curr_hash].append(dir)
                     self.dirsAttrsOnSubdirs[os.path.dirname(dir)].append(curr_hash)
-                #~ else:
-                    #~ print "Skipping %s %d %d %d %s" % (dir, len(dirsAttrsOnSubdirs[dir]), len(dirs), len(sizedirs[dirsizes[dir]]), str(dirsAttrsOnSubdirs[dir]))
+                else:
+                #    print "Skipping %s %d %d %d %s" % (dir, len(self.dirsAttrsOnSubdirs[dir]), len(dirs), len(self.sizedirs[self.dirsizes[dir]]), str(self.dirsAttrsOnSubdirs[dir]))
+                    print "Skipping %s : %s -- %d __ %s -- %d %d __ %s -- %d %d\n" % (dir, self.sizedirs[self.dirsizes[dir]], len(self.sizedirs[self.dirsizes[dir]]), self.dirsAttrsOnSubdirs[dir], len(self.dirsAttrsOnSubdirs[dir]), 1+len(dirs),  self.dirsAttrsOnFiles[dir], len(self.dirsAttrsOnFiles[dir]),(1+2*len(files2)))
 
     def __compute_duplicates(self):
         #~ dupdirset = set()
         for dupdirs in filter(lambda x: len(x)>1, self.hashdirs.values()):
             for currentdir in dupdirs:
                 parentdir = self.__bestParent(currentdir)
-                if not parentdir in self.dupresultsD[self.dirshash[parentdir]]:
+                if not parentdir in self.dupresultsD[self.dirshash[parentdir]]: # FIXME: can it happen since we use bestparent ?
                     self.dupresultsD[self.dirshash[parentdir]].append(parentdir)
                 #~ dupdirset.add(parentdir)
 
@@ -277,6 +284,53 @@ class dupcontext:
         """Print duplicate files found in the context"""
         self.__print_duplicates(self.dupresultsF, True)
 
+    def checkincluded(self, init_path, ref):
+        result = True
+        routourne = "/-\\|"
+        i=0
+        for path in [tmp for tmp in self.filesinodes.keys() if tmp.startswith(init_path)]:
+            inode = self.filesinodes[path]
+            myhash = self.inodeshash[inode]
+            if len(self.hashinodes[myhash]) < 2:
+                print "KO %s has no duplicates" % (path,)
+                result = False
+            inoderef = False
+            i+=1
+            for inode in self.hashinodes[myhash]:
+                for tmp in self.inodesfiles[inode]:
+                    if tmp.startswith(ref+'/'):
+                        inoderef = True
+                        sys.stdout.write('%s\r' % (routourne[i % 4],)) #print "OK %s has a duplicate in %s" % (path, tmp)
+            if (not inoderef):
+                result = False
+                print "KO %s is has no equivalent in %s" % (path, ref)
+        return result
+
+    def checkincluded3(self, init_path, ref):
+        result = True
+        routourne = "/-\\|"
+        i=0
+        for (dir, dirs, files) in os.walk(init_path, topdown=False):
+            files2 = [dir + '/' + tmp for tmp in files if dir+'/'+tmp in self.filesinodes and self.filesinodes[dir+'/'+tmp] != 0]
+            for path in files2:
+                inode = self.filesinodes[path]
+#            print "%s : %d" % (path, inode)
+                myhash = self.inodeshash[inode]
+                if len(self.hashinodes[myhash]) < 2:
+                    print "KO %s has no duplicates" % (path,)
+                    result = False
+                inoderef = False
+                i+=1
+                for inode in self.hashinodes[myhash]:
+                    for tmp in self.inodesfiles[inode]:
+                        if tmp.startswith(ref+'/'):
+                            inoderef = True
+                            sys.stdout.write('%s\r' % (routourne[i % 4],)) #print "OK %s has a duplicate in %s" % (path, tmp)
+                if (not inoderef):
+                    result = False
+                    print "KO %s is has no equivalent in %s" % (path, ref)
+        return result
+
 # Options
 SIZE_CKSUM = (1<<16)
 option_include_nullfiles = False
@@ -301,3 +355,5 @@ if __name__ == "__main__":
     context.print_dupdirs()
     print "\nDuplicate files:"
     context.print_dupfiles()
+    with open("/tmp/duplicide.pickle", 'w') as fh:
+        cPickle.dump(context, fh)
