@@ -37,8 +37,10 @@ from multiprocessing import Process, Array
 import random
 import cPickle
 
+import sqlite3,xxhash
+
 # TODO: allow disjoint chunks ? allow rdiff-like sliding-window CRC ?
-def checksum_file(filename, size=-1, hashalgo='crc32', chunk=-1): # (1<<12)
+def checksum_file(filename, size=-1, hashalgo='xxhash', chunk=-1): # (1<<12)
     # This function used to rely on mmap(), however this is an issue for big files on 32 bits machines
     #~ MAXMAPSIZE = 1<<(int(platform.architecture()[0][0:2])-1) - 1<<20  # FIXME: it also assumes number of bits takes 2 digits, so it does not work for 128bit platforms ! :). The 1<<20 is to take a small margin.
     """Performs a hash (CRC32, or any other supported by hashlib such as MD5 or SHA256) on the first [size] bytes of the file [filename]"""
@@ -59,7 +61,10 @@ def checksum_file(filename, size=-1, hashalgo='crc32', chunk=-1): # (1<<12)
                 readoffset += len(buf)
             return hex(mycrc & 0xffffffff) #~ hex(zlib.crc32(map[0:realsize]) & 0xffffffff)
         else:
-            digest = hashlib.new(hashalgo) # or md5.new()
+            if hashalgo == "md5":
+                digest = hashlib.new(hashalgo) # or md5.new()
+            else:
+                digest = xxhash.xxhash64()
             while (readoffset < readsize): # while len(buf) > 0 ?
                 buf = fh.read(readchunk)
                 digest.update(buf) #~ (map[0:realsize])
